@@ -12,6 +12,7 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+from torch.cuda.amp import autocast
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -122,13 +123,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
             load_model_as_complete(text_encoder_2, target_device=gpu)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
-        if cfg == 1:
-            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
-        else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            if cfg == 1:
+                llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+            else:
+                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
@@ -152,8 +153,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         if not high_vram:
             load_model_as_complete(vae, target_device=gpu)
-
-        start_latent = vae_encode(input_image_pt, vae)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            start_latent = vae_encode(input_image_pt, vae)
 
         # CLIP Vision
 
@@ -161,12 +162,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
-
-        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
         # Dtype
-
         llama_vec = llama_vec.to(transformer.dtype)
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
@@ -174,7 +174,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
         # Sampling
-
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
 
         rnd = torch.Generator("cpu").manual_seed(seed)
@@ -222,7 +221,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             def callback(d):
                 preview = d['denoised']
-                preview = vae_decode_fake(preview)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    preview = vae_decode_fake(preview)
 
                 preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
                 preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
@@ -237,8 +237,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
-
-            generated_latents = sample_hunyuan(
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                generated_latents = sample_hunyuan(
                 transformer=transformer,
                 sampler='unipc',
                 width=width,
@@ -282,12 +282,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
             if history_pixels is None:
-                history_pixels = vae_decode(real_history_latents, vae).cpu()
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    history_pixels = vae_decode(real_history_latents, vae).cpu()
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
-
-                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if not high_vram:

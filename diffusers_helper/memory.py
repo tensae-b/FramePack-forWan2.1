@@ -1,13 +1,8 @@
 # By lllyasviel
-
-
 import torch
-
-
 cpu = torch.device('cpu')
 gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
 gpu_complete_modules = []
-
 
 class DynamicSwapInstaller:
     @staticmethod
@@ -56,7 +51,6 @@ class DynamicSwapInstaller:
             DynamicSwapInstaller._uninstall_module(m)
         return
 
-
 def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.device):
     if hasattr(model, 'scale_shift_table'):
         model.scale_shift_table.data = model.scale_shift_table.data.to(target_device)
@@ -66,7 +60,6 @@ def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.d
         if hasattr(p, 'weight'):
             p.to(target_device)
             return
-
 
 def get_cuda_free_memory_gb(device=None):
     if device is None:
@@ -79,7 +72,6 @@ def get_cuda_free_memory_gb(device=None):
     bytes_inactive_reserved = bytes_reserved - bytes_active
     bytes_total_available = bytes_free_cuda + bytes_inactive_reserved
     return bytes_total_available / (1024 ** 3)
-
 
 def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0):
     print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
@@ -96,7 +88,6 @@ def move_model_to_device_with_memory_preservation(model, target_device, preserve
     torch.cuda.empty_cache()
     return
 
-
 def offload_model_from_device_for_memory_preservation(model, target_device, preserved_memory_gb=0):
     print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
 
@@ -112,7 +103,6 @@ def offload_model_from_device_for_memory_preservation(model, target_device, pres
     torch.cuda.empty_cache()
     return
 
-
 def unload_complete_models(*args):
     for m in gpu_complete_modules + list(args):
         m.to(device=cpu)
@@ -121,7 +111,6 @@ def unload_complete_models(*args):
     gpu_complete_modules.clear()
     torch.cuda.empty_cache()
     return
-
 
 def load_model_as_complete(model, target_device, unload=True):
     if unload:
