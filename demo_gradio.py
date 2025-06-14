@@ -224,7 +224,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     preview = vae_decode_fake(preview)
 
-                preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                # preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                preview = (preview * 255.0).detach().cpu().to(torch.float32).numpy().clip(0, 255).astype(np.uint8)
                 preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
                 if stream.input_queue.top() == 'end':
