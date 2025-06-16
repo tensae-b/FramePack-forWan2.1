@@ -12,7 +12,7 @@ import torchvision
 import safetensors.torch as sf
 from PIL import Image
 from torchcodec.codecs import H264Codec
-
+print("TorchCodec Implemented!")
 def min_resize(x, m):
     if x.shape[0] < x.shape[1]:
         s0 = m
