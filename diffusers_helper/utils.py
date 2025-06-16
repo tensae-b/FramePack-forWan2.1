@@ -11,8 +11,8 @@ import torchvision
 
 import safetensors.torch as sf
 from PIL import Image
-from torchcodec.codecs import H264Codec
-print("TorchCodec Implemented!")
+import ffmpeg
+print("ffmpeg_python Implemented!")
 def min_resize(x, m):
     if x.shape[0] < x.shape[1]:
         s0 = m
@@ -257,25 +257,38 @@ def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
     torchvision.io.write_video(output_filename, x, fps=fps, video_codec='libx264', options={'crf': str(int(crf))})
     return x
 
-def save_bcthw_as_mp4codec(x, output_filename, fps=10, crf = 23):
+def save_bcthw_as_mp4_ffmpeg(x, output_filename, fps=10, crf = 23):
     os.makedirs(os.path.dirname(os.path.abspath(output_filename)), exist_ok=True)
     
     # Normalize [-1, 1] → [0, 1]
-    x = torch.clamp((x.float() + 1) / 2, 0, 1)
-    x = einops.rearrange(x, 'b c t h w -> t h w c')
-    x = x.contiguous()
+    x_np = torch.clamp((x.float() + 1) / 2 * 255, 0, 255).to(torch.uint8)
+    # ffmpeg for each video individually.
+    T, C, H, W = x_np.shape[2], x_np.shape[1], x_np.shape[3], x_np.shape[4]
     
-    # Encode using TorchCodec H.264
-    codec = H264Codec(bitrate=2_000_000, framerate=fps)
-    video_bytes = codec.encode(x)
-    
-    with open(output_filename, "wb") as f:
-        f.write(video_bytes)
-        
+    # Rearrange for stacking batch items vertically, if batch size > 1
+    x_rearranged = einops.rearrange(x_np, 'b c t h w -> t (b h) w c')
+    current_H = x_rearranged.shape[1]
+    current_W = x_rearranged.shape[2]
+
+    # Set up the FFmpeg process using ffmpeg-python
+    process = (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{current_W}x{current_H}', r=fps)
+        .output(output_filename, pix_fmt='yuv420p', vcodec='libx264', preset='medium', crf=str(int(crf)))
+        .overwrite_output() # Overwrite output file if it exists
+        .run_async(pipe_stdin=True)
+    )
+    # Write each frame to FFmpeg's stdin
+    for i in range(x_rearranged.shape[0]): # Iterate through time dimension (T)
+        process.stdin.write(x_rearranged[i].numpy().tobytes()) # Convert to NumPy and then bytes
+
+    process.stdin.close()
+    process.wait() # Wait for FFmpeg to finish encoding
+
     return x
 
 def save_video_async(x, output_filename, fps=30, crf=23):
-    thread = threading.Thread(target=save_bcthw_as_mp4codec, args=(x, output_filename, fps, crf))
+    thread = threading.Thread(target=save_bcthw_as_mp4_ffmpeg, args=(x, output_filename, fps, crf))
     thread.start()
     return thread
 def save_bcthw_as_png(x, output_filename):
