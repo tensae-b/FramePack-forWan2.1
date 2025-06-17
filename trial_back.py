@@ -144,8 +144,8 @@ class QuantizedModelLoader:
                            quantization: str = 'int8', device: str = 'cuda') -> torch.nn.Module:
         """Load quantized model from checkpoint"""
         
-        if quantization == 'fp8':
-            model_path = 'downloads/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors'
+        if quantization == 'fp16':
+            model_path = 'downloads/Wan2_1-I2V-ATI-14B_fp16.safetensors'
             state_dict = sf.load_file(model_path, device='cpu')
     
             # Create model (adjust config for 14B if needed)
@@ -163,10 +163,12 @@ class QuantizedModelLoader:
             torch.cuda.empty_cache()
             
             # Keep as FP8 or fallback to FP16
-            try:
-                model = model.to(dtype=torch.float8_e4m3fn, device=device)
-            except:
-                model = model.to(dtype=torch.float16, device=device)
+            # try:
+            #     model = model.to(dtype=torch.float8_e4m3fn, device=device)
+            # except:
+            #     model = model.to(dtype=torch.float16, device=device)
+            model = model.to(dtype=torch.float16, device=device)
+            print("Loaded FP16 model successfully")
             
             return model.eval().requires_grad_(False)
         
@@ -436,7 +438,7 @@ class WanI2VFramePack:
         clip_fea = model_inputs['clip_context'] 
         y = model_inputs.get('conditional_latents', None)
         
-       
+        print(clip_fea.shape, 'here is clip shape')
         
         x_input = []
         y_input = []
@@ -489,10 +491,10 @@ class WanI2VFramePack:
         print('Starting FramePack generation...')
         
         # Preprocess image
-        img_input = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+        img_inputs = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
         
         # Calculate dimensions
-        h, w = img_input.shape[1:]
+        h, w = img_inputs.shape[1:]
         aspect_ratio = h / w
         lat_h = round(
             np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] // 
@@ -513,7 +515,7 @@ class WanI2VFramePack:
         # Initialize history tensors for progressive generation
         history_latents = torch.zeros(
             size=(1, 16, 1 + 2 + 16, lat_h, lat_w), 
-            dtype=torch.float32,
+            dtype=torch.float16,
             device=self.device
         )
         history_pixels = None
@@ -561,13 +563,27 @@ class WanI2VFramePack:
         # inputs = {k: v.to(self.device) for k, v in inputs.items()}
         outputs = self.clip_model(pixel_values=inputs['pixel_values'])
         clip_features = outputs.image_embeds
+        expected_dim = 1280
+        if clip_features.shape[-1] != expected_dim:
+            print(f"[WARNING] CLIP features have {clip_features.shape[-1]} dims, expected {expected_dim}")
+            # Create a simple projection layer if needed
+            if not hasattr(self, 'clip_projection'):
+                self.clip_projection = torch.nn.Linear(
+                    clip_features.shape[-1], 
+                    expected_dim, 
+                    device=self.device, 
+                    dtype=torch.float16
+                )
+            clip_features = self.clip_projection(clip_features)
+            if clip_features.dim() == 2:  # [batch, 1280]
+                clip_features = clip_features.unsqueeze(1)
         # clip_features = self.clip_model(**inputs).last_hidden_state
         clip_context = clip_features
         
         # Encode first frame with VAE
         if offload_model:
             self.vae.to(self.device)
-        img_input = img.unsqueeze(0).unsqueeze(2)  # (C,H,W) -> (1,C,1,H,W)
+        img_input = img_inputs.unsqueeze(0).unsqueeze(2)  # (C,H,W) -> (1,C,1,H,W)
     
         # if self.config.offload_models:
         #     self.vae.to(self.device)
@@ -681,7 +697,7 @@ class WanI2VFramePack:
             noise = torch.randn(
         1, 16, self.framepack_sampler.latent_window_size,  # e.g., (1, 16, 9, H, W)
         lat_h, lat_w,
-        dtype=torch.float32,
+        dtype=torch.float16,
         generator=seed_g,
         device=self.device
     )

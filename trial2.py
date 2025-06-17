@@ -43,8 +43,22 @@ def create_config():
 
 
 def main():
+    
+    from huggingface_hub import hf_hub_download
+    import os
+    import shutil
+    file_path = hf_hub_download(
+        repo_id="Kijai/WanVideo_comfy", 
+        filename="Wan2_1-I2V-ATI-14B_fp16.safetensors"
+    )
+    print(file_path)
+    target_dir = "/downloads"
+    os.makedirs(target_dir, exist_ok=True)  # Create it if it doesn't exist
+
+    # Move the file
+    shutil.copy(file_path, os.path.join(target_dir, "Wan2_1-I2V-ATI-14B_fp16.safetensors"))
     # Setup paths
-    checkpoint_dir = "downloads/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors"
+    checkpoint_dir = "downloads/Wan2_1-I2V-ATI-14B_fp16.safetensors"
     quantized_model_path = "/path/to/quantized/wan_model_int8.pt"  # Optional
     
     # Load image
@@ -59,7 +73,7 @@ def main():
         config=config,
         checkpoint_dir=checkpoint_dir,
         device_id=0,
-        use_quantization='fp8',  # Options: 'int8', 'fp16', 'bnb', None
+        use_quantization='fp16',  # Options: 'int8', 'fp16', 'bnb', None
         quantized_model_path=quantized_model_path,
         # offload_model=True,  # Important for memory management
         t5_cpu=True,  # Keep T5 on CPU to save GPU memory
