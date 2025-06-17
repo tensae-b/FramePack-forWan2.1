@@ -257,7 +257,7 @@ def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
     torchvision.io.write_video(output_filename, x, fps=fps, video_codec='libx264', options={'crf': str(int(crf))})
     return x
 
-def save_bcthw_as_mp4_ffmpeg(x, output_filename, fps=10, crf = 23):
+def save_bcthw_as_mp4_ffmpeg(x, output_filename, fps=10, crf = 23, use_nvenc=False):
     os.makedirs(os.path.dirname(os.path.abspath(output_filename)), exist_ok=True)
     
     # Normalize [-1, 1] → [0, 1]
@@ -287,8 +287,8 @@ def save_bcthw_as_mp4_ffmpeg(x, output_filename, fps=10, crf = 23):
 
     return x
 
-def save_video_async(x, output_filename, fps=30, crf=23):
-    thread = threading.Thread(target=save_bcthw_as_mp4_ffmpeg, args=(x, output_filename, fps, crf))
+def save_video_async(x, output_filename, fps=30, crf=23, use_nvenc=False):
+    thread = threading.Thread(target=save_bcthw_as_mp4_ffmpeg, args=(x, output_filename, fps, crf, use_nvenc))
     thread.start()
     return thread
 def save_bcthw_as_png(x, output_filename):
