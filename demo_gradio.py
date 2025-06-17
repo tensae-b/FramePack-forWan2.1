@@ -1,6 +1,6 @@
 from diffusers_helper.hf_login import login
 print("use_nvenc=True included")
-import os
+import os, time
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 print("This is running over the ffmpg")
@@ -27,7 +27,6 @@ from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_pro
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
@@ -102,10 +101,18 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    # Start timing the entire generation process ---
+    start_time = time.time()
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     job_id = generate_timestamp()
+    
+    end_time = time.time()
+    total_generation_time = end_time - start_time
+
+    # Print the total time to the console
+    print(f"Total time to generate {total_second_length} second video: {total_generation_time:.2f} seconds")
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
