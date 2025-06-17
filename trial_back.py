@@ -20,7 +20,7 @@ from PIL import Image
 from diffusers_helper.wan_components.wan.distributed.fsdp import shard_model
 from diffusers_helper.wan_components.wan.modules.clip import CLIPModel
 from diffusers_helper.wan_components.wan.modules.model import WanModel
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection,UMT5EncoderModel,AutoTokenizer
 from transformers import CLIPVisionModel, CLIPImageProcessor
 from diffusers import AutoencoderKLWan
 from diffusers_helper.wan_components.wan.modules.vae import WanVAE
@@ -217,24 +217,27 @@ class WanI2VFramePack:
         # Initialize components
         shard_fn = partial(shard_model, device_id=device_id)
         
-        # Text encoder
-        self.text_encoder = T5Encoder(
-            vocab=32128,
-            dim=512,
-            dim_attn=64,
-            dim_ffn=2048,
-            num_heads=8,
-            num_layers=6,
-            num_buckets=32,
-            shared_pos=True,
-            dropout=0.1
-        )
+        self.text_encoder = UMT5EncoderModel.from_pretrained("google/umt5-xxl")
+        self.tokenizer= AutoTokenizer.from_pretrained("google/umt5-xxl")
         
-        self.tokenizer = HuggingfaceTokenizer(
-            name="t5-small",
-            seq_len=64,
-            clean="canonicalize"
-        )
+        # # Text encoder
+        # self.text_encoder = T5Encoder(
+        #     vocab=32128,
+        #     dim=4096,
+        #     dim_attn=64,
+        #     dim_ffn=2048,
+        #     num_heads=8,
+        #     num_layers=6,
+        #     num_buckets=32,
+        #     shared_pos=True,
+        #     dropout=0.1
+        # )
+        
+        # self.tokenizer = HuggingfaceTokenizer(
+        #     name="t5-small",
+        #     seq_len=64,
+        #     clean="canonicalize"
+        # )
         
         # VAE
         self.vae_stride = config.vae_stride
@@ -245,8 +248,10 @@ class WanI2VFramePack:
         )
 
         # CLIP
-        self.clip_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
-        self.clip_model = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14").to(self.device)
+        self.clip_processor = CLIPImageProcessor.from_pretrained("Wan-AI/Wan2.1-I2V-14B-480P-Diffusers", subfolder='image_processor')
+        self.clip_model = CLIPVisionModelWithProjection.from_pretrained("Wan-AI/Wan2.1-I2V-14B-480P-Diffusers", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+        # self.clip_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        # self.clip_model = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14").to(self.device)
 
         # Load main model (potentially quantized)
         logging.info(f"Creating WanModel from {checkpoint_dir}")
@@ -354,113 +359,140 @@ class WanI2VFramePack:
    
 
     def prepare_wan_conditional_inputs(
-        self, 
-        start_latent: torch.Tensor, 
-        clean_latents: torch.Tensor = None, 
-        reference_noise: List[torch.Tensor] = None
-    ) -> List[torch.Tensor]:
-        """Prepare conditional inputs (y) for WAN model, expanding channels if needed"""
+    self, 
+    start_latent: torch.Tensor, 
+    # clean_latents: torch.Tensor = None, 
+    reference_noise: List[torch.Tensor] = None
+) -> List[torch.Tensor]:
+        """
+        Simplified approach: Create conditioning tensors that match reference_noise exactly
+        """
         import torch.nn.functional as F
-        if start_latent.device != self.device:
-            start_latent = start_latent.to(self.device)
-
+        if reference_noise is None:
+            raise ValueError("reference_noise is required to determine target shape")
+        
+        # Extract the conditioning frame
         if start_latent.dim() == 5:  # (B, C, T, H, W)
-            y_list = [start_latent[i] for i in range(start_latent.shape[0])]
+            if start_latent.shape[2] == 1:
+                conditioning_frame = start_latent.squeeze(2)  # (B, C, H, W)
+            else:
+                conditioning_frame = start_latent[:, :, 0:1, :, :].squeeze(2)  # Take first frame
+        elif start_latent.dim() == 4:  # (B, C, H, W)
+            conditioning_frame = start_latent
+        elif start_latent.dim() == 3:  # (C, H, W)
+            conditioning_frame = start_latent.unsqueeze(0)  # (1, C, H, W)
         else:
-            y_list = [start_latent]
+            raise ValueError(f"Unexpected start_latent shape: {start_latent.shape}")
+        
+        print(f"[DEBUG] conditioning_frame shape: {conditioning_frame.shape}")
+        
+        y_list = []
+        for i, ref_tensor in enumerate(reference_noise):
+            print(f"[DEBUG] Creating conditioning for ref_tensor[{i}] with shape: {ref_tensor.shape}")
+            
+            # ref_tensor shape: [C, T, H, W]
+            C, T, H, W = ref_tensor.shape
+            
+            # Extract single conditioning frame (should be first item in batch)
+            if conditioning_frame.shape[0] > 1:
+                single_frame = conditioning_frame[i]  # (C, H, W)
+            else:
+                single_frame = conditioning_frame[0]  # (C, H, W)
+            
+            print(f"[DEBUG] single_frame shape: {single_frame.shape}")
+            
+            # Resize conditioning frame to match reference spatial dimensions
+            if single_frame.shape[-2:] != (H, W):
+                print(f"[DEBUG] Resizing conditioning frame from {single_frame.shape[-2:]} to ({H}, {W})")
+                single_frame = F.interpolate(
+                    single_frame.unsqueeze(0),  # (1, C, H, W)
+                    size=(H, W),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0)  # (C, H, W)
+            
+            # Create conditioning tensor - Option 1: Repeat first frame
+            y_tensor = single_frame.unsqueeze(1).repeat(1, T, 1, 1)  # (C, T, H, W)
+            
+            # Alternative Option 2: First frame only, rest zeros
+            # y_tensor = torch.zeros(C, T, H, W, dtype=single_frame.dtype, device=single_frame.device)
+            # y_tensor[:, 0] = single_frame
+            
+            print(f"[DEBUG] Created y_tensor[{i}] with shape: {y_tensor.shape}")
+            y_list.append(y_tensor)
+        
+        return y_list
 
-        # Fix spatial and temporal size to match reference_noise
-        if reference_noise is not None:
-            for i in range(len(y_list)):
-                y = y_list[i]
-                ref = reference_noise[i]  # Shape: [C, T, H, W]
-
-                if y.shape != ref.shape:
-                    _, T, H, W = ref.shape
-                    y = F.interpolate(
-                        y.unsqueeze(0),  # Add batch dim → [1, C, T, H, W]
-                        size=(T, H, W),
-                        mode='trilinear',
-                        align_corners=False
-                    ).squeeze(0)  # Back to [C, T, H, W]
-
-                    y_list[i] = y
-
-        return torch.stack(y_list[i], dim=0)
-
+    
 
     def wan_sampling_step(self, model_inputs: Dict, timestep: torch.Tensor,
                          guidance_scale: float = 10.0) -> torch.Tensor:
-        """Perform one sampling step with WAN model"""
-        
-        # Prepare inputs for WAN model
-        x = model_inputs['noise_latents']
+        """Debug version to find where 52 channels come from"""
+    
+        """Fixed: x=20ch, y=16ch, total=36ch"""
+    
+        x = model_inputs['noise_latents']  
         context = model_inputs['text_context']
-        clip_fea = model_inputs['clip_context']
+        clip_fea = model_inputs['clip_context'] 
         y = model_inputs.get('conditional_latents', None)
         
-        # Calculate sequence length for positional encoding
-        # WAN expects seq_len to be the maximum possible sequence length for patchified tokens
-        if isinstance(x, list):
-            # Calculate based on spatial-temporal dimensions after patching
-            max_seq_len = 0
-            for tensor in x:
-                # tensor shape: (C, T, H, W)
-                t_patches = tensor.shape[1] // self.patch_size[0] 
-                h_patches = tensor.shape[2] // self.patch_size[1]
-                w_patches = tensor.shape[3] // self.patch_size[2]
-                seq_len = t_patches * h_patches * w_patches
-                max_seq_len = max(max_seq_len, seq_len)
-            seq_len = max_seq_len
-        else:
-            # Single tensor
-            t_patches = x.shape[2] // self.patch_size[0]
-            h_patches = x.shape[3] // self.patch_size[1] 
-            w_patches = x.shape[4] // self.patch_size[2]
-            seq_len = t_patches * h_patches * w_patches
+       
         
-        # Add some buffer for safety (WAN needs this for positional encoding)
-        seq_len = int(seq_len * 1.5)  # 50% buffer
+        x_input = []
+        y_input = []
         
-        # Forward pass through WAN model
+        for x_tensor, y_tensor in zip(x, y):
+            # x: 16 channels noise + 4 channels padding = 20 channels
+            x_16 = x_tensor[:16]
+            padding = torch.zeros(4, *x_16.shape[1:], dtype=x_16.dtype, device=x_16.device)
+            x_20 = torch.cat([x_16, padding], dim=0)  # 20 channels
+            
+            # y: 16 channels conditioning (separate)
+            y_16 = y_tensor[:16]  # 16 channels
+            
+            x_input.append(x_20)
+            y_input.append(y_16)
+        
+        seq_len = int(x_input[0].shape[1] * x_input[0].shape[2] * x_input[0].shape[3] * 1.5)
+        
         with torch.amp.autocast('cuda', dtype=self.param_dtype):
             model_output = self.model(
-                x=x,
+                x=x_input,      # 20 channels
                 t=timestep,
                 context=context,
                 seq_len=seq_len,
                 clip_fea=clip_fea,
-                y=y
+                y=y_input       # 16 channels
             )
         
         return model_output
 
     def generate_framepack(
-        self,
-        input_prompt: str,
-        img: Image.Image,
-        total_second_length: float = 5.0,
-        max_area: int = 720 * 1280,
-        shift: float = 5.0,
-        sample_solver: str = 'unipc',
-        sampling_steps: int = 25,
-        guide_scale: float = 10.0,
-        n_prompt: str = "",
-        seed: int = -1,
-        offload_model: bool = True,
-        use_teacache: bool = True,
-        progress_callback: Optional[callable] = None,
-    ) -> torch.Tensor:
+    self,
+    input_prompt: str,
+    img: Image.Image,
+    total_second_length: float = 5.0,
+    max_area: int = 720 * 1280,
+    shift: float = 5.0,
+    sample_solver: str = 'unipc',
+    sampling_steps: int = 25,
+    guide_scale: float = 10.0,
+    n_prompt: str = "",
+    seed: int = -1,
+    offload_model: bool = True,
+    use_teacache: bool = True,
+    progress_callback: Optional[callable] = None,
+) -> torch.Tensor:
         """
         Generate long video using FramePack's progressive sampling technique integrated with WAN
         """
-        print('here at  generate_framepack')
+        print('Starting FramePack generation...')
         
         # Preprocess image
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+        img_input = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
         
         # Calculate dimensions
-        h, w = img.shape[1:]
+        h, w = img_input.shape[1:]
         aspect_ratio = h / w
         lat_h = round(
             np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] // 
@@ -478,11 +510,11 @@ class WanI2VFramePack:
             total_second_length, fps=30
         )
         
-            # Initialize history tensors for progressive generation
+        # Initialize history tensors for progressive generation
         history_latents = torch.zeros(
             size=(1, 16, 1 + 2 + 16, lat_h, lat_w), 
             dtype=torch.float32,
-            device=self.device  # Ensure on correct device
+            device=self.device
         )
         history_pixels = None
         total_generated_latent_frames = 0
@@ -496,41 +528,63 @@ class WanI2VFramePack:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
             
-        # Text encoding
         if not self.t5_cpu:
-            input_ids, attention_mask = self.tokenizer(input_prompt, return_mask=True)
-            ninput_ids, nattention_mask = self.tokenizer(n_prompt, return_mask=True)
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder(input_ids, attention_mask)
-            context_null = self.text_encoder(ninput_ids, nattention_mask)
+            inputs = self.tokenizer(input_prompt, return_tensors="pt", padding=True, truncation=True)
+            n_inputs = self.tokenizer(n_prompt, return_tensors="pt", padding=True, truncation=True)
+
+            self.text_encoder.to(self.device)
+
+            with torch.no_grad():
+                context = self.text_encoder(**inputs.to(self.device)).last_hidden_state
+                context_null = self.text_encoder(**n_inputs.to(self.device)).last_hidden_state
+
             if offload_model:
-                self.text_encoder.model.cpu()
+                self.text_encoder.cpu()
+
         else:
-            input_ids, attention_mask = self.tokenizer(input_prompt, return_mask=True)
-            ninput_ids, nattention_mask = self.tokenizer(n_prompt, return_mask=True)
-            context = self.text_encoder(input_ids, attention_mask)
-            context_null = self.text_encoder(ninput_ids, nattention_mask)
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            inputs = self.tokenizer(input_prompt, return_tensors="pt", padding=True, truncation=True)
+            n_inputs = self.tokenizer(n_prompt, return_tensors="pt", padding=True, truncation=True)
+
+            with torch.no_grad():
+                context = self.text_encoder(**inputs).last_hidden_state
+                context_null = self.text_encoder(**n_inputs).last_hidden_state
+
+            # Move outputs to device
+            context = context.to(self.device)
+            context_null = context_null.to(self.device)
         
         # Encode CLIP features
-        img_clip = (img + 1.0) / 2.0 
-        inputs = self.clip_processor(images=img_clip, return_tensors="pt").to(self.device)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        clip_features = self.clip_model(**inputs).last_hidden_state
+        # img_clip = (img + 1.0) / 2.0 
+        inputs = self.clip_processor(images=img, return_tensors="pt").to(self.device)
+        pixel_values = inputs['pixel_values']  # shape: (1, 3, 224, 224)
+        self.clip_model.to(self.device)
+        # inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        outputs = self.clip_model(pixel_values=inputs['pixel_values'])
+        clip_features = outputs.image_embeds
+        # clip_features = self.clip_model(**inputs).last_hidden_state
         clip_context = clip_features
         
         # Encode first frame with VAE
         if offload_model:
             self.vae.to(self.device)
-        img_input = img.unsqueeze(0).unsqueeze(2)
+        img_input = img.unsqueeze(0).unsqueeze(2)  # (C,H,W) -> (1,C,1,H,W)
+    
+        # if self.config.offload_models:
+        #     self.vae.to(self.device)
         
         try:
             with torch.no_grad():
                 latent_dist = self.vae.encode(img_input)
-                start_latent = latent_dist.latent_dist.sample()
+                start_latent = latent_dist.latent_dist.sample()  # (1, C, 1, H, W)
+                
+                
+                
+                
+            # Remove temporal dimension for conditioning preparation
+              # (1, C, H, W)
+            
         except torch.cuda.OutOfMemoryError:
-            # Fallback: move to CPU and try again
+            # Fallback: move to CPU
             torch.cuda.empty_cache()
             img_cpu = img_input.cpu()
             self.vae.cpu()
@@ -538,9 +592,14 @@ class WanI2VFramePack:
             with torch.no_grad():
                 latent_dist = self.vae.encode(img_cpu)
                 start_latent = latent_dist.latent_dist.sample().to(self.device)
+                
+            # start_latent = start_latent.squeeze(2)  # (1, C, H, W)
             
-            if offload_model:
+            if self.config.offload_models:
                 self.vae.to(self.device)
+                
+        print(f"[DEBUG] Actual start_latent shape: {start_latent.shape}")
+        clean_latents_pre = start_latent.to(device=self.device, dtype=history_latents.dtype)
 
         # Initialize sampling scheduler (adapted for WAN)
         if sample_solver == 'unipc':
@@ -575,7 +634,9 @@ class WanI2VFramePack:
             target_shape = start_latent.shape[-2:]  # (H, W)
             
             # Ensure start_latent is on the correct device and dtype
-            clean_latents_pre = start_latent.to(device=self.device, dtype=history_latents.dtype)
+            
+            
+            
             
             # Ensure history has enough frames
             min_required_frames = 1 + 2 + 16  # 19 frames total
@@ -584,7 +645,7 @@ class WanI2VFramePack:
                 padding = torch.zeros(
                     1, 16, padding_needed, *target_shape,
                     dtype=history_latents.dtype,
-                    device=self.device  # Use self.device instead of history_latents.device
+                    device=self.device
                 )
                 history_latents = torch.cat([padding, history_latents], dim=2)
 
@@ -612,17 +673,18 @@ class WanI2VFramePack:
             # Ensure all clean latents are on the same device
             clean_latents_pre = clean_latents_pre.to(self.device)
             clean_latents_post = clean_latents_post.to(self.device)
+            print('here',clean_latents_pre.shape,clean_latents_post.shape  )
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
             
             # Generate noise for this section
             num_frames = self.framepack_sampler.latent_window_size * 4 - 3
             noise = torch.randn(
-                1, 16, self.framepack_sampler.latent_window_size,
-                lat_h, lat_w,
-                dtype=torch.float32,
-                generator=seed_g,
-                device=self.device
-            )
+        1, 16, self.framepack_sampler.latent_window_size,  # e.g., (1, 16, 9, H, W)
+        lat_h, lat_w,
+        dtype=torch.float32,
+        generator=seed_g,
+        device=self.device
+    )
             
             # Setup model
             if offload_model:
@@ -632,15 +694,23 @@ class WanI2VFramePack:
             # Initialize TeaCache if enabled and supported
             if use_teacache and hasattr(self.model, 'initialize_teacache'):
                 self.model.initialize_teacache(enable_teacache=True, num_steps=sampling_steps)
+                
+            start_latent = start_latent.squeeze(2)
             
             # Prepare inputs for WAN model
             # Convert noise to WAN's expected list format
             noise_list = self.prepare_wan_noise_inputs(noise)
             
-            # Conditional latents (conditioning frame)
-            # For WAN I2V, y should be the first frame for conditioning
+            # Conditional latents (conditioning frame) - FIXED: removed the extra comma
             start_latent, clean_latents = self.ensure_device_consistency(start_latent, clean_latents)
-            y_list = self.prepare_wan_conditional_inputs(start_latent,reference_noise=noise_list),
+            y_list = self.prepare_wan_conditional_inputs(
+        start_latent,  # (1, C, H, W)
+        
+        reference_noise=noise_list
+    ) 
+        print("Corrected shapes:")
+        for i, (x_tensor, y_tensor) in enumerate(zip(noise_list, y_list)):
+            print(f"  x[{i}].shape = {x_tensor.shape}, y[{i}].shape = {y_tensor.shape}")
             
             # Denoising loop with FramePack context
             latents = noise
@@ -658,15 +728,15 @@ class WanI2VFramePack:
                     'clip_context': clip_context,
                     'conditional_latents': y_list
                 }
+                
+                # Debug prints
                 x = model_inputs['noise_latents']
                 y = model_inputs['conditional_latents']
-                for i, latent in enumerate(model_inputs['noise_latents']):
-                    print(f"noise_latents[{i}] shape: {latent.shape}")
-                    
                 print("WAN model input shapes:")
                 for i, (u, v) in enumerate(zip(x, y)):
                     print(f"  x[{i}].shape = {u.shape}, y[{i}].shape = {v.shape}")
-                # # Classifier-free guidance
+                
+                # Classifier-free guidance
                 if guide_scale > 1.0:
                     # Conditional prediction
                     model_inputs['text_context'] = context
