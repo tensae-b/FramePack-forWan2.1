@@ -39,7 +39,6 @@ args = parser.parse_args()
 # For linux server probably use --server 127.0.0.1 or do not use any cmd flags
 
 print(args)
-
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
 
@@ -98,22 +97,15 @@ stream = AsyncStream()
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
-
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
-    # Start timing the entire generation process ---
+    # Start timing the entire generation process
     start_time = time.time()
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     job_id = generate_timestamp()
     
-    end_time = time.time()
-    total_generation_time = end_time - start_time
-
-    # Print the total time to the console
-    print(f"Total time to generate {total_second_length} second video: {total_generation_time:.2f} seconds")
-
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
@@ -124,7 +116,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             )
 
         # Text encoding
-
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
         if not high_vram:
@@ -142,7 +133,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
         # Processing input image
-
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
         H, W, C = input_image.shape
@@ -315,6 +305,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if is_last_section:
                 break
+        #Calculate and print time 
+        end_time = time.time()
+        total_generation_time = end_time - start_time
+        print(f"Total time to generate {total_second_length} second video: {total_generation_time:.2f} seconds (Success)")
+        stream.output_queue.push(('end', f"Generation completed in {total_generation_time:.2f} seconds")) 
+        return
     except:
         traceback.print_exc()
 
@@ -325,7 +321,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
     stream.output_queue.push(('end', None))
     return
-
 
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
     global stream
@@ -354,17 +349,14 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
             yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
             break
 
-
 def end_process():
     stream.input_queue.push('end')
-
 
 quick_prompts = [
     'The girl dances gracefully, with clear movements, full of charm.',
     'A character doing some simple body movements.',
 ]
 quick_prompts = [[x] for x in quick_prompts]
-
 
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
@@ -411,7 +403,6 @@ with block:
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
-
 
 block.launch(
     server_name=args.server,
