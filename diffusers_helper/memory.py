@@ -77,39 +77,40 @@ def move_model_to_device_with_memory_preservation(model, target_device, preserve
     print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
     # Clear cache at the beginning to ensure the subsequent memory check is accurate.
     torch.cuda.empty_cache()
-    
-    for m in model.modules():
-        if get_cuda_free_memory_gb(target_device) <= preserved_memory_gb:
-            torch.cuda.empty_cache()
-            return
+    with torch.cuda.stream(stream) if stream is not None else torch.cuda.current_stream():
+        for m in model.modules():
+            if get_cuda_free_memory_gb(target_device) <= preserved_memory_gb:
+                torch.cuda.empty_cache()
+                return
 
-        if hasattr(m, 'weight'):
-            # m.to(device=target_device)
-            # Use non_blocking=True for asynchronous transfers
-            m.to(device=target_device, non_blocking=True) if stream is None else m.to(device=target_device, non_blocking=True, stream=stream)
+            if hasattr(m, 'weight'):
+                # m.to(device=target_device)
+                # Use non_blocking=True for asynchronous transfers
+                m.to(device=target_device, non_blocking=True)
 
-    # Final full model move (for non-DynamicSwap or to ensure consistency)
-    model.to(device=target_device, non_blocking=True) if stream is None else model.to(device=target_device, non_blocking=True, stream=stream)
-    # model.to(device=target_device)
+        # Final full model move (for non-DynamicSwap or to ensure consistency)
+        model.to(device=target_device, non_blocking=True) 
+        # model.to(device=target_device)
     torch.cuda.empty_cache()
     return
 
 def offload_model_from_device_for_memory_preservation(model, target_device, preserved_memory_gb=0,stream=None):
     print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
 
-    for m in model.modules():
-        if get_cuda_free_memory_gb(target_device) >= preserved_memory_gb:
-            torch.cuda.empty_cache()
-            return
+    with torch.cuda.stream(stream) if stream is not None else torch.cuda.current_stream():
+        for m in model.modules():
+            if get_cuda_free_memory_gb(target_device) >= preserved_memory_gb:
+                torch.cuda.empty_cache()
+                return
 
-        if hasattr(m, 'weight'):
-            # Pass the stream to the .to() call
-            m.to(device=cpu, non_blocking=True) if stream is None else m.to(device=cpu, non_blocking=True, stream=stream)
-            # m.to(device=cpu)
+            if hasattr(m, 'weight'):
+                # Pass the stream to the .to() call
+                m.to(device=cpu, non_blocking=True) 
+                # m.to(device=cpu)
 
-    # model.to(device=cpu)
-    # Final full model move to CPU
-    model.to(device=cpu, non_blocking=True) if stream is None else model.to(device=cpu, non_blocking=True, stream=stream)
+        # model.to(device=cpu)
+        # Final full model move to CPU
+        model.to(device=cpu, non_blocking=True)
     torch.cuda.empty_cache()
     return
 
