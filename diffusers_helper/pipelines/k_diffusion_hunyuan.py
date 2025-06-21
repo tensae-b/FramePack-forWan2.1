@@ -47,7 +47,7 @@ def sample_hunyuan(
         negative_prompt_embeds=None,
         negative_prompt_embeds_mask=None,
         negative_prompt_poolers=None,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         device=None,
         negative_kwargs=None,
         callback=None,

@@ -45,16 +45,16 @@ high_vram = free_mem_gb > 60
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
 
-text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
-text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
+text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.bfloat16).cpu()
+text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.bfloat16).cpu()
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
 tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
-vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
+vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.bfloat16).cpu()
 
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
-image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.bfloat16).cpu()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.float16).cpu()
+transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
 
 vae.eval()
 text_encoder.eval()
@@ -69,11 +69,11 @@ if not high_vram:
 transformer.high_quality_fp32_output_for_inference = False
 print('transformer.high_quality_fp32_output_for_inference = False')
 
-transformer.to(dtype=torch.float16)
-vae.to(dtype=torch.float16)
-image_encoder.to(dtype=torch.float16)
-text_encoder.to(dtype=torch.float16)
-text_encoder_2.to(dtype=torch.float16)
+transformer.to(dtype=torch.bfloat16)
+vae.to(dtype=torch.bfloat16)
+image_encoder.to(dtype=torch.bfloat16)
+text_encoder.to(dtype=torch.bfloat16)
+text_encoder_2.to(dtype=torch.bfloat16)
 
 vae.requires_grad_(False)
 text_encoder.requires_grad_(False)
@@ -135,7 +135,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 load_model_as_complete(text_encoder_2, target_device=gpu, unload=False, stream=transfer_stream)
         
         # Perform text encoding computation on compute_stream
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_stream(transfer_stream)
                 llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
@@ -174,7 +174,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             with torch.cuda.stream(transfer_stream):
                 # Pass stream
                 load_model_as_complete(vae, target_device=gpu, stream=transfer_stream)
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             with torch.cuda.stream(compute_stream):
                 # Compute waits for VAE to be on GPU
                 compute_stream.wait_stream(transfer_stream)
@@ -188,7 +188,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             # Pass Stream
             with torch.cuda.stream(transfer_stream):
                 load_model_as_complete(image_encoder, target_device=gpu,stream=transfer_stream)
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             with torch.cuda.stream(compute_stream):
                 # Compute waits for image encoder
                 compute_stream.wait_stream(transfer_stream) 
@@ -258,7 +258,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             def callback(d):
                 preview = d['denoised']
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     preview = vae_decode_fake(preview)
 
                 # preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
@@ -275,7 +275,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 with torch.cuda.stream(compute_stream):
                     # Transformer compute waits for its transfer
                     compute_stream.wait_stream(transfer_stream) 
@@ -298,7 +298,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                     negative_prompt_embeds_mask=llama_attention_mask_n,
                     negative_prompt_poolers=clip_l_pooler_n,
                     device=gpu,
-                    dtype=torch.float16,
+                    dtype=torch.bfloat16,
                     image_embeddings=image_encoder_last_hidden_state,
                     latent_indices=latent_indices,
                     clean_latents=clean_latents,
@@ -327,20 +327,20 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 with torch.cuda.stream(compute_stream):
                     # VAE compute waits for its transfer
                     compute_stream.wait_stream(transfer_stream) 
     
             if history_pixels is None:
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     with torch.cuda.stream(compute_stream):
                         history_pixels = vae_decode(real_history_latents, vae).cpu()
                 torch.cuda.current_stream().wait_stream(compute_stream)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     with torch.cuda.stream(compute_stream):
                         current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                         history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
