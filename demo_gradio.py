@@ -1,9 +1,9 @@
 from diffusers_helper.hf_login import login
-
-import os
+print("use_nvenc=True included")
+import os, time
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
-
+print("This is running over the ffmpg")
 import gradio as gr
 import torch
 import traceback
@@ -12,12 +12,13 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+from torch.cuda.amp import autocast
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
-from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
+from diffusers_helper.utils import save_bcthw_as_mp4,save_video_async, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
@@ -26,7 +27,6 @@ from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_pro
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
@@ -39,7 +39,6 @@ args = parser.parse_args()
 # For linux server probably use --server 127.0.0.1 or do not use any cmd flags
 
 print(args)
-
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
 
@@ -67,8 +66,8 @@ if not high_vram:
     vae.enable_slicing()
     vae.enable_tiling()
 
-transformer.high_quality_fp32_output_for_inference = True
-print('transformer.high_quality_fp32_output_for_inference = True')
+transformer.high_quality_fp32_output_for_inference = False
+print('transformer.high_quality_fp32_output_for_inference = False')
 
 transformer.to(dtype=torch.bfloat16)
 vae.to(dtype=torch.float16)
@@ -98,43 +97,64 @@ stream = AsyncStream()
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
-
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    # Empty existing cache
+    torch.cuda.empty_cache()
+    # Start timing the entire generation process
+    start_time = time.time()
+    
+    # Steams for pipelining and parallel processing
+    compute_stream = torch.cuda.Stream()
+    transfer_stream = torch.cuda.Stream()
+    
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     job_id = generate_timestamp()
-
+    
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
         # Clean GPU
         if not high_vram:
-            unload_complete_models(
+            # Perform initial model cleanup on current stream, 
+            with torch.cuda.stream(transfer_stream):
+                unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
 
         # Text encoding
-
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
         if not high_vram:
-            fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
-            load_model_as_complete(text_encoder_2, target_device=gpu)
+            # Load text encoders on transfer_stream
+            with torch.cuda.stream(transfer_stream):
+                fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
+                # Pass Stream
+                load_model_as_complete(text_encoder_2, target_device=gpu, unload=False, stream=transfer_stream)
+        
+        # Perform text encoding computation on compute_stream
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_stream(transfer_stream)
+                llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
-        if cfg == 1:
-            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
-        else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
+                if cfg == 1:
+                    llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+                else:
+                    llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        torch.cuda.current_stream().wait_stream(compute_stream)
+        
+        # Offload text encoders on transfer_stream if needed
+        with torch.cuda.stream(transfer_stream):
+            offload_model_from_device_for_memory_preservation(text_encoder, target_device=gpu, preserved_memory_gb=0, stream=transfer_stream) # Pass stream
+            offload_model_from_device_for_memory_preservation(text_encoder_2, target_device=gpu, preserved_memory_gb=0, stream=transfer_stream) # Pass stream
+        
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
         # Processing input image
-
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
         H, W, C = input_image.shape
@@ -151,22 +171,31 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
 
         if not high_vram:
-            load_model_as_complete(vae, target_device=gpu)
-
-        start_latent = vae_encode(input_image_pt, vae)
+            with torch.cuda.stream(transfer_stream):
+                # Pass stream
+                load_model_as_complete(vae, target_device=gpu, stream=transfer_stream)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with torch.cuda.stream(compute_stream):
+                # Compute waits for VAE to be on GPU
+                compute_stream.wait_stream(transfer_stream)
+                start_latent = vae_encode(input_image_pt, vae)
 
         # CLIP Vision
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
 
         if not high_vram:
-            load_model_as_complete(image_encoder, target_device=gpu)
-
-        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+            # Pass Stream
+            with torch.cuda.stream(transfer_stream):
+                load_model_as_complete(image_encoder, target_device=gpu,stream=transfer_stream)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with torch.cuda.stream(compute_stream):
+                # Compute waits for image encoder
+                compute_stream.wait_stream(transfer_stream) 
+                image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-
+        torch.cuda.current_stream().wait_stream(compute_stream)
         # Dtype
-
         llama_vec = llama_vec.to(transformer.dtype)
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
@@ -174,7 +203,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
         # Sampling
-
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
 
         rnd = torch.Generator("cpu").manual_seed(seed)
@@ -212,8 +240,16 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
             if not high_vram:
-                unload_complete_models()
-                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+                with torch.cuda.stream(transfer_stream):
+                    # Pass stream to every offloading
+                    # unload_complete_models()
+                    transfer_stream.wait_stream(compute_stream)
+                    offload_model_from_device_for_memory_preservation(vae, target_device=gpu, preserved_memory_gb=8, stream=transfer_stream) 
+                    offload_model_from_device_for_memory_preservation(image_encoder, target_device=gpu, preserved_memory_gb=8, stream=transfer_stream)
+                    offload_model_from_device_for_memory_preservation(text_encoder, target_device=gpu, preserved_memory_gb=8, stream=transfer_stream)
+                    offload_model_from_device_for_memory_preservation(text_encoder_2, target_device=gpu, preserved_memory_gb=8, stream=transfer_stream)
+
+                    move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation, stream=transfer_stream)
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
@@ -222,9 +258,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             def callback(d):
                 preview = d['denoised']
-                preview = vae_decode_fake(preview)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    preview = vae_decode_fake(preview)
 
-                preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                # preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                preview = (preview * 255.0).detach().cpu().to(torch.float32).numpy().clip(0, 255).astype(np.uint8)
                 preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
                 if stream.input_queue.top() == 'end':
@@ -237,38 +275,42 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
-
-            generated_latents = sample_hunyuan(
-                transformer=transformer,
-                sampler='unipc',
-                width=width,
-                height=height,
-                frames=num_frames,
-                real_guidance_scale=cfg,
-                distilled_guidance_scale=gs,
-                guidance_rescale=rs,
-                # shift=3.0,
-                num_inference_steps=steps,
-                generator=rnd,
-                prompt_embeds=llama_vec,
-                prompt_embeds_mask=llama_attention_mask,
-                prompt_poolers=clip_l_pooler,
-                negative_prompt_embeds=llama_vec_n,
-                negative_prompt_embeds_mask=llama_attention_mask_n,
-                negative_prompt_poolers=clip_l_pooler_n,
-                device=gpu,
-                dtype=torch.bfloat16,
-                image_embeddings=image_encoder_last_hidden_state,
-                latent_indices=latent_indices,
-                clean_latents=clean_latents,
-                clean_latent_indices=clean_latent_indices,
-                clean_latents_2x=clean_latents_2x,
-                clean_latent_2x_indices=clean_latent_2x_indices,
-                clean_latents_4x=clean_latents_4x,
-                clean_latent_4x_indices=clean_latent_4x_indices,
-                callback=callback,
-            )
-
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                with torch.cuda.stream(compute_stream):
+                    # Transformer compute waits for its transfer
+                    compute_stream.wait_stream(transfer_stream) 
+                    generated_latents = sample_hunyuan(
+                    transformer=transformer,
+                    sampler='unipc',
+                    width=width,
+                    height=height,
+                    frames=num_frames,
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=gs,
+                    guidance_rescale=rs,
+                    # shift=3.0,
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=gpu,
+                    dtype=torch.bfloat16,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
+                )
+            # Synchronize before moving generated_latents to CPU or VAE processing
+            torch.cuda.current_stream().wait_stream(compute_stream)
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
@@ -276,34 +318,62 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             if not high_vram:
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                load_model_as_complete(vae, target_device=gpu)
+                with torch.cuda.stream(transfer_stream):
+                    # Offload transformer
+                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8, stream=transfer_stream)
+                    # offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+                    load_model_as_complete(vae, target_device=gpu, unload=False, stream=transfer_stream)
+                    # load_model_as_complete(vae, target_device=gpu)
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                with torch.cuda.stream(compute_stream):
+                    # VAE compute waits for its transfer
+                    compute_stream.wait_stream(transfer_stream) 
+    
             if history_pixels is None:
-                history_pixels = vae_decode(real_history_latents, vae).cpu()
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    with torch.cuda.stream(compute_stream):
+                        history_pixels = vae_decode(real_history_latents, vae).cpu()
+                torch.cuda.current_stream().wait_stream(compute_stream)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
-
-                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
-                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
-
-            if not high_vram:
-                unload_complete_models()
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    with torch.cuda.stream(compute_stream):
+                        current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                        history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                torch.cuda.current_stream().wait_stream(compute_stream)
+            # This Subsequent offloading of VAE will be handled specifically on a stream
+            # if not high_vram:
+            #     unload_complete_models()
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
 
-            save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf)
-
+            # save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf,use_nvenc? )
+            video_save_thread = save_video_async(history_pixels, output_filename, fps=30, crf=mp4_crf, use_nvenc=True)
+            # Wait for the video saving thread to complete
+            video_save_thread.join()
+            
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
             stream.output_queue.push(('file', output_filename))
 
             if is_last_section:
                 break
-    except:
+        #Calculate and print time 
+        end_time = time.time()
+        total_generation_time = end_time - start_time
+        print(f"Total time to generate {total_second_length} second video: {total_generation_time:.2f} seconds (Success)")
+        stream.output_queue.push(('end', f"Generation completed in {total_generation_time:.2f} seconds")) 
+        return
+    except Exception as e:
+        
+        end_time = time.time()
+        total_generation_time = end_time - start_time
+        print(f"Total time to generate {total_second_length} second video (Error Occurred): {total_generation_time:.2f} seconds (Error)")
+        
         traceback.print_exc()
 
         if not high_vram:
@@ -342,17 +412,14 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
             yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
             break
 
-
 def end_process():
     stream.input_queue.push('end')
-
 
 quick_prompts = [
     'The girl dances gracefully, with clear movements, full of charm.',
     'A character doing some simple body movements.',
 ]
 quick_prompts = [[x] for x in quick_prompts]
-
 
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
@@ -376,7 +443,8 @@ with block:
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
                 total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
-                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
+                # Making the latent_window_size visible in the gradio_UI
+                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
 
                 cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
@@ -399,7 +467,6 @@ with block:
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
-
 
 block.launch(
     server_name=args.server,

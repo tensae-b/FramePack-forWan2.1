@@ -103,7 +103,6 @@ def vae_decode(latents, vae, image_mode=False):
 
     return image
 
-
 @torch.no_grad()
 def vae_encode(image, vae):
     latents = vae.encode(image.to(device=vae.device, dtype=vae.dtype)).latent_dist.sample()

@@ -1,13 +1,8 @@
 # By lllyasviel
-
-
 import torch
-
-
 cpu = torch.device('cpu')
 gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
 gpu_complete_modules = []
-
 
 class DynamicSwapInstaller:
     @staticmethod
@@ -56,7 +51,6 @@ class DynamicSwapInstaller:
             DynamicSwapInstaller._uninstall_module(m)
         return
 
-
 def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.device):
     if hasattr(model, 'scale_shift_table'):
         model.scale_shift_table.data = model.scale_shift_table.data.to(target_device)
@@ -66,7 +60,6 @@ def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.d
         if hasattr(p, 'weight'):
             p.to(target_device)
             return
-
 
 def get_cuda_free_memory_gb(device=None):
     if device is None:
@@ -80,38 +73,46 @@ def get_cuda_free_memory_gb(device=None):
     bytes_total_available = bytes_free_cuda + bytes_inactive_reserved
     return bytes_total_available / (1024 ** 3)
 
-
-def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0):
+def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0, stream = None):
     print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
+    # Clear cache at the beginning to ensure the subsequent memory check is accurate.
+    torch.cuda.empty_cache()
+    with torch.cuda.stream(stream) if stream is not None else torch.cuda.current_stream():
+        for m in model.modules():
+            if get_cuda_free_memory_gb(target_device) <= preserved_memory_gb:
+                torch.cuda.empty_cache()
+                return
 
-    for m in model.modules():
-        if get_cuda_free_memory_gb(target_device) <= preserved_memory_gb:
-            torch.cuda.empty_cache()
-            return
+            if hasattr(m, 'weight'):
+                # m.to(device=target_device)
+                # Use non_blocking=True for asynchronous transfers
+                m.to(device=target_device, non_blocking=True)
 
-        if hasattr(m, 'weight'):
-            m.to(device=target_device)
-
-    model.to(device=target_device)
+        # Final full model move (for non-DynamicSwap or to ensure consistency)
+        model.to(device=target_device, non_blocking=True) 
+        # model.to(device=target_device)
     torch.cuda.empty_cache()
     return
 
-
-def offload_model_from_device_for_memory_preservation(model, target_device, preserved_memory_gb=0):
+def offload_model_from_device_for_memory_preservation(model, target_device, preserved_memory_gb=0,stream=None):
     print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
 
-    for m in model.modules():
-        if get_cuda_free_memory_gb(target_device) >= preserved_memory_gb:
-            torch.cuda.empty_cache()
-            return
+    with torch.cuda.stream(stream) if stream is not None else torch.cuda.current_stream():
+        for m in model.modules():
+            if get_cuda_free_memory_gb(target_device) >= preserved_memory_gb:
+                torch.cuda.empty_cache()
+                return
 
-        if hasattr(m, 'weight'):
-            m.to(device=cpu)
+            if hasattr(m, 'weight'):
+                # Pass the stream to the .to() call
+                m.to(device=cpu, non_blocking=True) 
+                # m.to(device=cpu)
 
-    model.to(device=cpu)
+        # model.to(device=cpu)
+        # Final full model move to CPU
+        model.to(device=cpu, non_blocking=True)
     torch.cuda.empty_cache()
     return
-
 
 def unload_complete_models(*args):
     for m in gpu_complete_modules + list(args):
@@ -122,12 +123,13 @@ def unload_complete_models(*args):
     torch.cuda.empty_cache()
     return
 
-
-def load_model_as_complete(model, target_device, unload=True):
+def load_model_as_complete(model, target_device, unload=True, stream = None):
     if unload:
         unload_complete_models()
-
-    model.to(device=target_device)
+        
+    # model.to(device=target_device)
+    # Call move_model_to_device_with_memory_preservation with the stream
+    move_model_to_device_with_memory_preservation(model, target_device, stream=stream)
     print(f'Loaded {model.__class__.__name__} to {target_device} as complete.')
 
     gpu_complete_modules.append(model)

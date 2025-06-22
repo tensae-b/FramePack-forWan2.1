@@ -131,7 +131,7 @@ class FlowMatchUniPC:
             t_prev_list = t_prev_list[-order:]
 
             if callback is not None:
-                callback({'x': x, 'i': i, 'denoised': model_prev_list[-1]})
+                callback({'x': x, 'i': i, 'denoised': model_prev_list[-1].to(torch.float32)})
 
         return model_prev_list[-1]
 

@@ -1,4 +1,4 @@
-import os
+import os, threading
 import cv2
 import json
 import random
@@ -11,8 +11,8 @@ import torchvision
 
 import safetensors.torch as sf
 from PIL import Image
-
-
+import ffmpeg
+print("ffmpeg_python Implemented!")
 def min_resize(x, m):
     if x.shape[0] < x.shape[1]:
         s0 = m
@@ -29,7 +29,6 @@ def min_resize(x, m):
     y = cv2.resize(x, (s1, s0), interpolation=interpolation)
     return y
 
-
 def d_resize(x, y):
     H, W, C = y.shape
     new_min = min(H, W)
@@ -40,7 +39,6 @@ def d_resize(x, y):
         interpolation = cv2.INTER_LANCZOS4
     y = cv2.resize(x, (W, H), interpolation=interpolation)
     return y
-
 
 def resize_and_center_crop(image, target_width, target_height):
     if target_height == image.shape[0] and target_width == image.shape[1]:
@@ -58,7 +56,6 @@ def resize_and_center_crop(image, target_width, target_height):
     bottom = (resized_height + target_height) / 2
     cropped_image = resized_image.crop((left, top, right, bottom))
     return np.array(cropped_image)
-
 
 def resize_and_center_crop_pytorch(image, target_width, target_height):
     B, C, H, W = image.shape
@@ -78,7 +75,6 @@ def resize_and_center_crop_pytorch(image, target_width, target_height):
 
     return cropped
 
-
 def resize_without_crop(image, target_width, target_height):
     if target_height == image.shape[0] and target_width == image.shape[1]:
         return image
@@ -86,7 +82,6 @@ def resize_without_crop(image, target_width, target_height):
     pil_image = Image.fromarray(image)
     resized_image = pil_image.resize((target_width, target_height), Image.LANCZOS)
     return np.array(resized_image)
-
 
 def just_crop(image, w, h):
     if h == image.shape[0] and w == image.shape[1]:
@@ -101,7 +96,6 @@ def just_crop(image, w, h):
     cropped_image = image[y_start:y_start + new_height, x_start:x_start + new_width]
     return cropped_image
 
-
 def write_to_json(data, file_path):
     temp_file_path = file_path + ".tmp"
     with open(temp_file_path, 'wt', encoding='utf-8') as temp_file:
@@ -109,16 +103,13 @@ def write_to_json(data, file_path):
     os.replace(temp_file_path, file_path)
     return
 
-
 def read_from_json(file_path):
     with open(file_path, 'rt', encoding='utf-8') as file:
         data = json.load(file)
     return data
 
-
 def get_active_parameters(m):
     return {k: v for k, v in m.named_parameters() if v.requires_grad}
-
 
 def cast_training_params(m, dtype=torch.float32):
     result = {}
@@ -127,7 +118,6 @@ def cast_training_params(m, dtype=torch.float32):
             param.data = param.to(dtype)
             result[n] = param
     return result
-
 
 def separate_lora_AB(parameters, B_patterns=None):
     parameters_normal = {}
@@ -144,14 +134,12 @@ def separate_lora_AB(parameters, B_patterns=None):
 
     return parameters_normal, parameters_B
 
-
 def set_attr_recursive(obj, attr, value):
     attrs = attr.split(".")
     for name in attrs[:-1]:
         obj = getattr(obj, name)
     setattr(obj, attrs[-1], value)
     return
-
 
 def print_tensor_list_size(tensors):
     total_size = 0
@@ -172,7 +160,6 @@ def print_tensor_list_size(tensors):
     print(f"Total number of parameters: {total_elements_B:.3f} billion")
     return
 
-
 @torch.no_grad()
 def batch_mixture(a, b=None, probability_a=0.5, mask_a=None):
     batch_size = a.size(0)
@@ -188,13 +175,11 @@ def batch_mixture(a, b=None, probability_a=0.5, mask_a=None):
     result = torch.where(mask_a, a, b)
     return result
 
-
 @torch.no_grad()
 def zero_module(module):
     for p in module.parameters():
         p.detach().zero_()
     return module
-
 
 @torch.no_grad()
 def supress_lower_channels(m, k, alpha=0.01):
@@ -206,14 +191,12 @@ def supress_lower_channels(m, k, alpha=0.01):
     m.weight.data = data.contiguous().clone()
     return m
 
-
 def freeze_module(m):
     if not hasattr(m, '_forward_inside_frozen_module'):
         m._forward_inside_frozen_module = m.forward
     m.requires_grad_(False)
     m.forward = torch.no_grad()(m.forward)
     return m
-
 
 def get_latest_safetensors(folder_path):
     safetensors_files = glob.glob(os.path.join(folder_path, '*.safetensors'))
@@ -225,20 +208,17 @@ def get_latest_safetensors(folder_path):
     latest_file = os.path.abspath(os.path.realpath(latest_file))
     return latest_file
 
-
 def generate_random_prompt_from_tags(tags_str, min_length=3, max_length=32):
     tags = tags_str.split(', ')
     tags = random.sample(tags, k=min(random.randint(min_length, max_length), len(tags)))
     prompt = ', '.join(tags)
     return prompt
 
-
 def interpolate_numbers(a, b, n, round_to_int=False, gamma=1.0):
     numbers = a + (b - a) * (np.linspace(0, 1, n) ** gamma)
     if round_to_int:
         numbers = np.round(numbers).astype(int)
     return numbers.tolist()
-
 
 def uniform_random_by_intervals(inclusive, exclusive, n, round_to_int=False):
     edges = np.linspace(0, 1, n + 1)
@@ -247,7 +227,6 @@ def uniform_random_by_intervals(inclusive, exclusive, n, round_to_int=False):
     if round_to_int:
         numbers = np.round(numbers).astype(int)
     return numbers.tolist()
-
 
 def soft_append_bcthw(history, current, overlap=0):
     if overlap <= 0:
@@ -261,7 +240,6 @@ def soft_append_bcthw(history, current, overlap=0):
     output = torch.cat([history[:, :, :-overlap], blended, current[:, :, overlap:]], dim=2)
 
     return output.to(history)
-
 
 def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
     b, c, t, h, w = x.shape
@@ -279,7 +257,40 @@ def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
     torchvision.io.write_video(output_filename, x, fps=fps, video_codec='libx264', options={'crf': str(int(crf))})
     return x
 
+def save_bcthw_as_mp4_ffmpeg(x, output_filename, fps=10, crf = 23, use_nvenc=False):
+    os.makedirs(os.path.dirname(os.path.abspath(output_filename)), exist_ok=True)
+    
+    # Normalize [-1, 1] → [0, 1]
+    x_np = torch.clamp((x.float() + 1) / 2 * 255, 0, 255).to(torch.uint8)
+    # ffmpeg for each video individually.
+    T, C, H, W = x_np.shape[2], x_np.shape[1], x_np.shape[3], x_np.shape[4]
+    
+    # Rearrange for stacking batch items vertically, if batch size > 1
+    x_rearranged = einops.rearrange(x_np, 'b c t h w -> t (b h) w c')
+    current_H = x_rearranged.shape[1]
+    current_W = x_rearranged.shape[2]
 
+    # Set up the FFmpeg process using ffmpeg-python
+    process = (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{current_W}x{current_H}', r=fps)
+        .output(output_filename, pix_fmt='yuv420p', vcodec='libx264', preset='medium', crf=str(int(crf)))
+        .overwrite_output() # Overwrite output file if it exists
+        .run_async(pipe_stdin=True)
+    )
+    # Write each frame to FFmpeg's stdin
+    for i in range(x_rearranged.shape[0]): # Iterate through time dimension (T)
+        process.stdin.write(x_rearranged[i].numpy().tobytes()) # Convert to NumPy and then bytes
+
+    process.stdin.close()
+    process.wait() # Wait for FFmpeg to finish encoding
+
+    return x
+
+def save_video_async(x, output_filename, fps=30, crf=23, use_nvenc=False):
+    thread = threading.Thread(target=save_bcthw_as_mp4_ffmpeg, args=(x, output_filename, fps, crf, use_nvenc))
+    thread.start()
+    return thread
 def save_bcthw_as_png(x, output_filename):
     os.makedirs(os.path.dirname(os.path.abspath(os.path.realpath(output_filename))), exist_ok=True)
     x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
@@ -288,7 +299,6 @@ def save_bcthw_as_png(x, output_filename):
     torchvision.io.write_png(x, output_filename)
     return output_filename
 
-
 def save_bchw_as_png(x, output_filename):
     os.makedirs(os.path.dirname(os.path.abspath(os.path.realpath(output_filename))), exist_ok=True)
     x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
@@ -296,7 +306,6 @@ def save_bchw_as_png(x, output_filename):
     x = einops.rearrange(x, 'b c h w -> c h (b w)')
     torchvision.io.write_png(x, output_filename)
     return output_filename
-
 
 def add_tensors_with_padding(tensor1, tensor2):
     if tensor1.shape == tensor2.shape:
@@ -316,7 +325,6 @@ def add_tensors_with_padding(tensor1, tensor2):
     result = padded_tensor1 + padded_tensor2
     return result
 
-
 def print_free_mem():
     torch.cuda.empty_cache()
     free_mem, total_mem = torch.cuda.mem_get_info(0)
@@ -325,7 +333,6 @@ def print_free_mem():
     print(f"Free memory: {free_mem_mb:.2f} MB")
     print(f"Total memory: {total_mem_mb:.2f} MB")
     return
-
 
 def print_gpu_parameters(device, state_dict, log_count=1):
     summary = {"device": device, "keys_count": len(state_dict)}
@@ -340,7 +347,6 @@ def print_gpu_parameters(device, state_dict, log_count=1):
 
     print(str(summary))
     return
-
 
 def visualize_txt_as_img(width, height, text, font_path='font/DejaVuSans.ttf', size=18):
     from PIL import Image, ImageDraw, ImageFont
@@ -379,7 +385,6 @@ def visualize_txt_as_img(width, height, text, font_path='font/DejaVuSans.ttf', s
 
     return np.array(txt)
 
-
 def blue_mark(x):
     x = x.copy()
     c = x[:, :, 2]
@@ -394,7 +399,6 @@ def green_mark(x):
     x[:, :, 0] = -1
     return x
 
-
 def frame_mark(x):
     x = x.copy()
     x[:64] = -1
@@ -402,7 +406,6 @@ def frame_mark(x):
     x[:, :8] = 1
     x[:, -8:] = 1
     return x
-
 
 @torch.inference_mode()
 def pytorch2numpy(imgs):
@@ -414,13 +417,11 @@ def pytorch2numpy(imgs):
         results.append(y)
     return results
 
-
 @torch.inference_mode()
 def numpy2pytorch(imgs):
     h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.5 - 1.0
     h = h.movedim(-1, 1)
     return h
-
 
 @torch.no_grad()
 def duplicate_prefix_to_suffix(x, count, zero_out=False):
@@ -429,10 +430,8 @@ def duplicate_prefix_to_suffix(x, count, zero_out=False):
     else:
         return torch.cat([x, x[:count]], dim=0)
 
-
 def weighted_mse(a, b, weight):
     return torch.mean(weight.float() * (a.float() - b.float()) ** 2)
-
 
 def clamped_linear_interpolation(x, x_min, y_min, x_max, y_max, sigma=1.0):
     x = (x - x_min) / (x_max - x_min)
@@ -440,10 +439,8 @@ def clamped_linear_interpolation(x, x_min, y_min, x_max, y_max, sigma=1.0):
     x = x ** sigma
     return y_min + x * (y_max - y_min)
 
-
 def expand_to_dims(x, target_dims):
     return x.view(*x.shape, *([1] * max(0, target_dims - x.dim())))
-
 
 def repeat_to_batch_size(tensor: torch.Tensor, batch_size: int):
     if tensor is None:
@@ -461,18 +458,14 @@ def repeat_to_batch_size(tensor: torch.Tensor, batch_size: int):
 
     return tensor.repeat(repeat_times, *[1] * (tensor.dim() - 1))
 
-
 def dim5(x):
     return expand_to_dims(x, 5)
-
 
 def dim4(x):
     return expand_to_dims(x, 4)
 
-
 def dim3(x):
     return expand_to_dims(x, 3)
-
 
 def crop_or_pad_yield_mask(x, length):
     B, F, C = x.shape
@@ -487,7 +480,6 @@ def crop_or_pad_yield_mask(x, length):
         return y, mask
 
     return x[:, :length, :], torch.ones((B, length), dtype=torch.bool, device=device)
-
 
 def extend_dim(x, dim, minimal_length, zero_pad=False):
     original_length = int(x.shape[dim])
@@ -506,7 +498,6 @@ def extend_dim(x, dim, minimal_length, zero_pad=False):
 
     return torch.cat([x, padding], dim=dim)
 
-
 def lazy_positional_encoding(t, repeats=None):
     if not isinstance(t, list):
         t = [t]
@@ -523,7 +514,6 @@ def lazy_positional_encoding(t, repeats=None):
 
     return te
 
-
 def state_dict_offset_merge(A, B, C=None):
     result = {}
     keys = A.keys()
@@ -539,7 +529,6 @@ def state_dict_offset_merge(A, B, C=None):
             result[key] = A_value + B_value - C_value
 
     return result
-
 
 def state_dict_weighted_merge(state_dicts, weights):
     if len(state_dicts) != len(weights):
@@ -567,7 +556,6 @@ def state_dict_weighted_merge(state_dicts, weights):
 
     return result
 
-
 def group_files_by_folder(all_files):
     grouped_files = {}
 
@@ -580,14 +568,12 @@ def group_files_by_folder(all_files):
     list_of_lists = list(grouped_files.values())
     return list_of_lists
 
-
 def generate_timestamp():
     now = datetime.datetime.now()
     timestamp = now.strftime('%y%m%d_%H%M%S')
     milliseconds = f"{int(now.microsecond / 1000):03d}"
     random_number = random.randint(0, 9999)
     return f"{timestamp}_{milliseconds}_{random_number}"
-
 
 def write_PIL_image_with_png_info(image, metadata, path):
     from PIL.PngImagePlugin import PngInfo
@@ -599,12 +585,10 @@ def write_PIL_image_with_png_info(image, metadata, path):
     image.save(path, "PNG", pnginfo=png_info)
     return image
 
-
 def torch_safe_save(content, path):
     torch.save(content, path + '_tmp')
     os.replace(path + '_tmp', path)
     return path
-
 
 def move_optimizer_to_device(optimizer, device):
     for state in optimizer.state.values():
